@@ -7,18 +7,23 @@ logger = logging.getLogger("vouchsafe.db")
 # Global connection pool instance
 pool = None
 
-import asyncpg
-import logging
 
-logger = logging.getLogger("vouchsafe.db")
-pool = None
-
-async def init_db(database_url: str):
+async def init_db(dsn: str):
+    """Initializes PostgreSQL connection pool and ensures required tables exist."""
     global pool
+    if not dsn:
+        logger.warning("DATABASE_URL not set. Database functions will run in bypass mode.")
+        return
+
+    # Fix legacy dialect prefix if present
+    if dsn.startswith("postgres://"):
+        dsn = dsn.replace("postgres://", "postgresql://", 1)
+
     try:
-        pool = await asyncpg.create_pool(dsn=database_url)
+        pool = await asyncpg.create_pool(dsn=dsn, min_size=1, max_size=10)
         async with pool.acquire() as conn:
-            await conn.execute("""
+            await conn.execute(
+                """
                 CREATE TABLE IF NOT EXISTS tickets (
                     ticket_id VARCHAR(64) PRIMARY KEY,
                     guild_id BIGINT NOT NULL,
@@ -38,13 +43,23 @@ async def init_db(database_url: str):
                     comment TEXT,
                     created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
                 );
-            """)
+                """
+            )
         logger.info("PostgreSQL database pool established and tables verified.")
     except Exception as e:
         logger.error(f"Failed to connect to PostgreSQL: {e}")
+        pool = None
 
 
-async def create_ticket(ticket_id: str, guild_id: int, creator_id: int, order_type: str, amount: float, title: str, vault_address: str):
+async def create_ticket(
+    ticket_id: str,
+    guild_id: int,
+    creator_id: int,
+    order_type: str,
+    amount: float,
+    title: str,
+    vault_address: str,
+):
     """Persists a newly created escrow ticket into PostgreSQL."""
     if not pool:
         logger.warning(f"Database pool offline. Ticket {ticket_id} skipped database write.")
@@ -57,7 +72,13 @@ async def create_ticket(ticket_id: str, guild_id: int, creator_id: int, order_ty
             VALUES ($1, $2, $3, $4, $5, $6, $7, 'PENDING')
             ON CONFLICT (ticket_id) DO NOTHING;
             """,
-            ticket_id, str(guild_id), str(creator_id), order_type, amount, title, vault_address
+            ticket_id,
+            int(guild_id),
+            int(creator_id),
+            order_type,
+            amount,
+            title,
+            vault_address,
         )
 
 
@@ -69,7 +90,7 @@ async def get_ticket(ticket_id: str):
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
             "SELECT ticket_id, title, status, amount, vault_address FROM tickets WHERE ticket_id = $1;",
-            ticket_id
+            ticket_id,
         )
         return dict(row) if row else None
 
@@ -82,7 +103,8 @@ async def update_ticket_status(ticket_id: str, status: str):
     async with pool.acquire() as conn:
         await conn.execute(
             "UPDATE tickets SET status = $1 WHERE ticket_id = $2;",
-            status, ticket_id
+            status,
+            ticket_id,
         )
 
 
@@ -97,5 +119,7 @@ async def update_reputation(user_id: int, rating: int, comment: str):
             INSERT INTO reputation (user_id, rating, comment)
             VALUES ($1, $2, $3);
             """,
-            str(user_id), rating, comment
+            int(user_id),
+            rating,
+            comment,
         )
