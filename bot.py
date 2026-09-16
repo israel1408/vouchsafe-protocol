@@ -1,174 +1,213 @@
 import os
+import asyncio
+import logging
 import discord
-from discord import app_commands, Interaction, ButtonStyle, Color
 from discord.ext import commands
-from discord.ui import View, Modal, TextInput, button, Button
 from dotenv import load_dotenv
 
-# Internal Module Imports
-from verifier import process_verification_job
-from listener import update_discord_thread_embed
-from reputation import VouchScoreEngine
+# Local protocol modules
+from db import init_db, create_ticket, get_ticket, update_ticket_status, update_reputation
+from verifier import verify_host_node
+from reputation import calculate_vouch_score
+from relay import LiquidityRelay
 
+# Load environment variables
 load_dotenv()
 
-TOKEN = os.getenv("DISCORD_BOT_TOKEN")
-GUILD_ID = os.getenv("DISCORD_GUILD_ID")
+DISCORD_BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN")
+REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
+DATABASE_URL = os.getenv("DATABASE_URL")
+TREASURY_WALLET_ADDRESS = os.getenv(
+    "TREASURY_WALLET_ADDRESS", "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"
+)
+VERCEL_DEPOSIT_URL = os.getenv("VERCEL_DEPOSIT_URL", "https://vouchsafe.vercel.app/deposit")
 
-class VouchSafeBot(commands.Bot):
-    def __init__(self):
-        intents = discord.Intents.default()
-        intents.message_content = True
-        super().__init__(command_prefix="!", intents=intents)
+# Configure Logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("vouchsafe.bot")
 
-    async def setup_hook(self):
-        if GUILD_ID:
-            guild = discord.Object(id=int(GUILD_ID))
-            self.tree.copy_global_to(guild=guild)
-            await self.tree.sync(guild=guild)
+# Bot Setup & Gateway Intents
+intents = discord.Intents.default()
+intents.message_content = True
+intents.guilds = True
+intents.members = True
 
-bot = VouchSafeBot()
+bot = commands.Bot(command_prefix="!", intents=intents)
 
-class EscrowTicketView(View):
-    """Persistent control panel view inside private escrow ticket threads."""
-
-    def __init__(self, ticket_id: str, vault_address: str, seller_id: int, buyer_id: int, asset_type: str, asset_target: str):
-        super().__init__(timeout=None)
-        self.ticket_id = ticket_id
-        self.vault_address = vault_address
-        self.seller_id = seller_id
-        self.buyer_id = buyer_id
-        self.asset_type = asset_type
-        self.asset_target = asset_target
-
-    @button(label="1. Verify Asset API", style=ButtonStyle.primary, custom_id="btn_verify_asset")
-    async def verify_asset_callback(self, interaction: Interaction, button: Button):
-        if interaction.user.id not in [self.seller_id, self.buyer_id]:
-            await interaction.response.send_message("❌ Unauthorized: Only transaction participants can trigger verification.", ephemeral=True)
-            return
-
-        await interaction.response.send_message("⏳ Contacting VouchSafe API Verification Engine...", ephemeral=True)
-
-        verified = await process_verification_job(
-            ticket_id=self.ticket_id,
-            asset_type=self.asset_type,
-            target_id=self.asset_target,
-            expected_value=str(self.buyer_id)
-        )
-
-        if verified:
-            embed = interaction.message.embeds[0]
-            for field in embed.fields:
-                if field.name == "Asset Verification":
-                    field.value = "🟢 VERIFIED"
-            await interaction.message.edit(embed=embed)
-            await interaction.followup.send("✅ **Asset ownership verified via API!**", ephemeral=True)
-        else:
-            await interaction.followup.send("⚠️ **Verification pending or failed.** Ensure transfer parameters are correct.", ephemeral=True)
-
-    @button(label="2. Deposit Portal (Base L2)", style=ButtonStyle.secondary, custom_id="btn_deposit_funds")
-    async def deposit_funds_callback(self, interaction: Interaction, button: Button):
-        portal_url = f"https://vouchsafe.io/deposit?ticket={self.ticket_id}&vault={self.vault_address}"
-        await interaction.response.send_message(
-            f"🔗 Connect wallet and complete deposit on Base L2:\n<{portal_url}>\n\nVault: `{self.vault_address}`",
-            ephemeral=True
-        )
-
-    @button(label="3. Confirm & Release", style=ButtonStyle.success, custom_id="btn_release_funds")
-    async def release_funds_callback(self, interaction: Interaction, button: Button):
-        if interaction.user.id != self.buyer_id:
-            await interaction.response.send_message("❌ Only the buyer can approve final fund release.", ephemeral=True)
-            return
-
-        await interaction.response.defer()
-
-        await update_discord_thread_embed(
-            channel_id=str(interaction.channel_id),
-            message_id=str(interaction.message.id),
-            new_state="🟢 SETTLED & DISBURSED",
-            color_code=0x2ecc71
-        )
-
-        await interaction.followup.send("🎉 **Deal Completed!** Escrow vault payout disbursed on Base L2.")
+# Instantiate Liquidity Relay
+relay = LiquidityRelay(bot, REDIS_URL)
 
 
-class EscrowInitModal(Modal, title="VouchSafe | Initialize OTC Escrow"):
-    seller_id = TextInput(label="Seller Discord User ID", placeholder="e.g. 123456789012345678", required=True)
-    asset_type = TextInput(label="Asset Category", placeholder="Whop Store / Domain / Discord / GitHub", required=True)
-    amount_usdc = TextInput(label="Escrow Amount (USDC)", placeholder="1500.00", required=True)
-    asset_target = TextInput(label="Asset Identifier / API Target", placeholder="company_id, domain, or repo-name", required=True)
+@bot.event
+async def on_ready():
+    logger.info(f"VouchSafe Bot online as {bot.user} (ID: {bot.user.id})")
 
-    async def on_submit(self, interaction: Interaction):
-        await interaction.response.defer(ephemeral=True)
+    # Initialize PostgreSQL Async Connection Pool
+    try:
+        await init_db(DATABASE_URL)
+        logger.info("PostgreSQL database pool established.")
+    except Exception as e:
+        logger.error(f"Database initialization failed: {e}")
 
-        thread = await interaction.channel.create_thread(
-            name=f"escrow-{interaction.user.name[:8]}-vs-{self.seller_id.value[:4]}",
-            type=discord.ChannelType.private_thread
-        )
+    # Initialize Redis Liquidity Relay and start background listener
+    try:
+        await relay.initialize()
+        bot.loop.create_task(relay.start_listener())
+        logger.info("Global liquidity relay active and listening.")
+    except Exception as e:
+        logger.error(f"Failed to launch LiquidityRelay: {e}")
 
-        await thread.add_user(interaction.user)
-        try:
-            seller_user = await interaction.client.fetch_user(int(self.seller_id.value))
-            await thread.add_user(seller_user)
-            seller_mention = seller_user.mention
-            seller_id_int = seller_user.id
-        except Exception:
-            seller_mention = f"<@{self.seller_id.value}>"
-            seller_id_int = int(self.seller_id.value)
 
-        ticket_id = f"ESC-{thread.id}"
-        mock_vault_address = "0x71C7656EC7ab88b098defB751B7401B5f6d8976F"
+# ==============================================================================
+# ESCROW & TICKET COMMANDS
+# ==============================================================================
 
-        embed = discord.Embed(
-            title=f"🛡️ VouchSafe Escrow Vault #{ticket_id}",
-            description=f"Automated OTC Escrow between {interaction.user.mention} (Buyer) and {seller_mention} (Seller).",
-            color=Color.gold()
-        )
-        embed.add_field(name="Asset Category", value=self.asset_type.value, inline=True)
-        embed.add_field(name="Deposit Required", value=f"${float(self.amount_usdc.value):,.2f} USDC", inline=True)
-        embed.add_field(name="Asset Target", value=f"`{self.asset_target.value}`", inline=False)
-        embed.add_field(name="Vault State", value="🟡 AWAITING_DEPOSIT", inline=True)
-        embed.add_field(name="Asset Verification", value="🔴 UNVERIFIED", inline=True)
-        embed.add_field(name="Vault Contract (Base L2)", value=f"`{mock_vault_address}`", inline=False)
-        embed.set_footer(text="VouchSafe Protocol | Cryptographic OTC Escrow")
+@bot.command(name="escrow")
+async def create_escrow_cmd(ctx: commands.Context, order_type: str, amount: float, *, title: str):
+    """
+    Creates an escrow ticket, stores it in PostgreSQL, and syndicates to Redis Pub/Sub.
+    Usage: !escrow BUY 450.00 4x RTX 4090 Compute Cluster
+    """
+    order_type_upper = order_type.upper()
+    if order_type_upper not in ["BUY", "SELL"]:
+        await ctx.send("❌ Order type must be `BUY` or `SELL`.")
+        return
 
-        view = EscrowTicketView(
+    ticket_id = f"ESC-{ctx.message.id % 100000:05d}"
+
+    # Persist ticket into PostgreSQL
+    try:
+        await create_ticket(
             ticket_id=ticket_id,
-            vault_address=mock_vault_address,
-            seller_id=seller_id_int,
-            buyer_id=interaction.user.id,
-            asset_type=self.asset_type.value,
-            asset_target=self.asset_target.value
+            guild_id=ctx.guild.id,
+            creator_id=ctx.author.id,
+            order_type=order_type_upper,
+            amount=amount,
+            title=title,
+            vault_address=TREASURY_WALLET_ADDRESS
         )
+    except Exception as e:
+        logger.error(f"Failed to save ticket {ticket_id} to DB: {e}")
 
-        await thread.send(content=f"{interaction.user.mention} {seller_mention}", embed=embed, view=view)
-        await interaction.followup.send(f"Escrow thread created: {thread.mention}", ephemeral=True)
+    # Render Discord UI Embed
+    deposit_link = f"{VERCEL_DEPOSIT_URL}?ticket={ticket_id}&vault={TREASURY_WALLET_ADDRESS}&amount={amount}"
+    embed = discord.Embed(
+        title=f"🔒 Escrow Vault Ticket | {ticket_id}",
+        description=f"**Title:** {title}\n**Type:** `{order_type_upper}`\n**Amount:** **${amount:,.2f} USDC**",
+        color=discord.Color.gold()
+    )
+    embed.add_field(name="Target Chain", value="Base L2", inline=True)
+    embed.add_field(name="Escrow Vault", value=f"`{TREASURY_WALLET_ADDRESS}`", inline=False)
+    embed.add_field(name="Deposit Portal", value=f"[Connect Wallet & Deposit]({deposit_link})", inline=False)
+    embed.set_footer(text="VouchSafe Protocol • Base L2 Trustless Escrow")
+
+    ticket_msg = await ctx.send(embed=embed)
+
+    # Publish to Cross-Server Liquidity Relay
+    order_payload = {
+        "origin_guild_id": ctx.guild.id,
+        "origin_guild_name": ctx.guild.name,
+        "ticket_id": ticket_id,
+        "order_type": order_type_upper,
+        "title": title,
+        "details": f"Created by @{ctx.author.name} in #{ctx.channel.name}",
+        "price_usdc": amount,
+        "vault_address": TREASURY_WALLET_ADDRESS,
+        "channel_jump_url": ticket_msg.jump_url
+    }
+
+    await relay.publish_order(order_payload)
+    await ctx.message.add_reaction("🌐")
 
 
-@bot.tree.command(name="escrow", description="Create an automated VouchSafe escrow vault deal")
-async def escrow_command(interaction: Interaction):
-    await interaction.response.send_modal(EscrowInitModal())
+@bot.command(name="status")
+async def get_status_cmd(ctx: commands.Context, ticket_id: str):
+    """Fetches the real-time status of an escrow ticket from the database."""
+    ticket = await get_ticket(ticket_id)
+    if not ticket:
+        await ctx.send(f"❌ Ticket `{ticket_id}` not found.")
+        return
+
+    embed = discord.Embed(
+        title=f"📋 Ticket Status | {ticket_id}",
+        color=discord.Color.blue()
+    )
+    embed.add_field(name="Title", value=ticket["title"], inline=False)
+    embed.add_field(name="Status", value=f"`{ticket['status']}`", inline=True)
+    embed.add_field(name="Amount", value=f"${ticket['amount']:,.2f} USDC", inline=True)
+    embed.add_field(name="Vault", value=f"`{ticket['vault_address']}`", inline=False)
+    await ctx.send(embed=embed)
 
 
-@bot.tree.command(name="reputation", description="Lookup a trader's VouchScore and historical rating")
-@app_commands.describe(user="User to inspect")
-async def reputation_command(interaction: Interaction, user: discord.User = None):
-    target_user = user or interaction.user
+# ==============================================================================
+# VERIFICATION & REPUTATION COMMANDS
+# ==============================================================================
 
-    score = VouchScoreEngine.calculate_score(total_volume_usdc=15000.0, successful_trades=8, disputes_lost=0, account_age_days=90)
-    data = VouchScoreEngine.generate_reputation_embed_data(str(target_user.id), score, 15000.0, 8)
+@bot.command(name="verify")
+async def verify_cmd(ctx: commands.Context, ticket_id: str, host_endpoint: str):
+    """Triggers node automated verification check before releasing funds."""
+    await ctx.send(f"🔍 Running verification checks on `{host_endpoint}` for ticket `{ticket_id}`...")
+    
+    is_valid, report = await verify_host_node(host_endpoint)
+    
+    if is_valid:
+        await update_ticket_status(ticket_id, "VERIFIED")
+        embed = discord.Embed(
+            title="✅ Host Node Verification Passed",
+            description=f"Ticket `{ticket_id}` assets verified.\n```\n{report}\n```",
+            color=discord.Color.green()
+        )
+    else:
+        embed = discord.Embed(
+            title="❌ Verification Failed",
+            description=f"Ticket `{ticket_id}` failed compliance checks.\n```\n{report}\n```",
+            color=discord.Color.red()
+        )
+    
+    await ctx.send(embed=embed)
 
-    embed = discord.Embed(title=data["title"], color=Color.gold())
-    embed.add_field(name="VouchScore Rating", value=data["score"], inline=True)
-    embed.add_field(name="Tier Class", value=data["tier"], inline=True)
-    embed.add_field(name="Fee Discount", value=data["fee_discount"], inline=True)
-    embed.add_field(name="Total Settled Volume", value=data["total_volume"], inline=True)
-    embed.add_field(name="Completed Trades", value=str(data["completed_trades"]), inline=True)
-    embed.add_field(name="Single Trade Limit", value=data["max_trade_limit"], inline=True)
-    embed.set_footer(text="VouchSafe Reputation Engine")
 
-    await interaction.response.send_message(embed=embed)
+@bot.command(name="vouch")
+async def vouch_cmd(ctx: commands.Context, target_user: discord.Member, rating: int, *, comment: str = "No comment"):
+    """
+    Submits a vouch for a counterparty to adjust their global VouchScore.
+    Usage: !vouch @user 5 Fast node setup, 100% uptime
+    """
+    if rating < 1 or rating > 5:
+        await ctx.send("❌ Rating must be between 1 and 5 stars.")
+        return
+
+    if target_user.id == ctx.author.id:
+        await ctx.send("❌ You cannot vouch for yourself.")
+        return
+
+    new_score = await calculate_vouch_score(target_user.id, rating)
+    await update_reputation(target_user.id, rating, comment)
+
+    embed = discord.Embed(
+        title="⭐ Vouch Recorded",
+        description=f"Vouched for {target_user.mention} ({rating}/5 Stars)\n*\"{comment}\"*",
+        color=discord.Color.gold()
+    )
+    embed.add_field(name="Updated VouchScore", value=f"**{new_score:.1f} / 100.0**", inline=True)
+    await ctx.send(embed=embed)
+
+
+# ==============================================================================
+# ERROR HANDLING
+# ==============================================================================
+
+@bot.event
+async def on_command_error(ctx: commands.Context, error):
+    if isinstance(error, commands.MissingRequiredArgument):
+        await ctx.send(f"❌ Missing argument: `{error.param.name}`. Type `!help` for command usage.")
+    elif isinstance(error, commands.BadArgument):
+        await ctx.send("❌ Invalid argument type provided.")
+    else:
+        logger.error(f"Unhandled error in command '{ctx.command}': {error}")
 
 
 if __name__ == "__main__":
-    bot.run(TOKEN)
+    if not DISCORD_BOT_TOKEN:
+        raise ValueError("CRITICAL: DISCORD_BOT_TOKEN environment variable is missing.")
+    bot.run(DISCORD_BOT_TOKEN)
