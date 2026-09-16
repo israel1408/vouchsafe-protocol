@@ -1,65 +1,28 @@
-import math
-import time
-from typing import Dict, Any
+import logging
 
-BASE_SCORE = 100
-MAX_SCORE = 1000
+logger = logging.getLogger("vouchsafe.reputation")
 
-class VouchScoreEngine:
+async def calculate_vouch_score(user_id: int, rating: int) -> float:
+    """
+    Calculates an updated VouchScore rating for a user on a 0.0 to 100.0 scale.
+    Ratings range from 1 to 5 stars, adjusting score delta based on performance.
+    """
+    base_score = 100.0
+    
+    # Rating impact mapping (1 star = -5.0, 3 stars = 0.0, 5 stars = +5.0)
+    rating_delta = (rating - 3) * 2.5
+    
+    # Compute new score clamped strictly between 0.0 and 100.0
+    new_score = max(0.0, min(100.0, base_score + rating_delta))
+    logger.info(f"User {user_id} VouchScore updated: {new_score:.1f} (Rating input: {rating})")
+    return new_score
 
-    @staticmethod
-    def calculate_score(
-        total_volume_usdc: float,
-        successful_trades: int,
-        disputes_lost: int,
-        account_age_days: int
-    ) -> int:
-        """
-        Calculates a user's non-transferable VouchScore (100 - 1000 scale).
-        Uses logarithmic scaling on volume to prevent manipulation via micro-transactions.
-        """
-        if successful_trades == 0:
-            return BASE_SCORE
 
-        # 1. Volume Factor (Max 350 pts)
-        volume_score = min(350, math.log10(max(1, total_volume_usdc)) * 70)
-
-        # 2. Trade Count Factor (Max 250 pts)
-        trade_score = min(250, successful_trades * 15)
-
-        # 3. Longevity Factor (Max 100 pts)
-        longevity_score = min(100, account_age_days * 0.5)
-
-        # 4. Dispute Penalty (High penalty for failed/fraudulent deals)
-        dispute_penalty = disputes_lost * 200
-
-        raw_score = BASE_SCORE + volume_score + trade_score + longevity_score - dispute_penalty
-        return int(max(BASE_SCORE, min(MAX_SCORE, raw_score)))
-
-    @staticmethod
-    def get_tier(score: int) -> Dict[str, Any]:
-        """Returns the reputation badge, fee discounts, and single-trade limits based on VouchScore."""
-        if score >= 900:
-            return {"tier": "Apex OTC Trader", "badge": "💎", "fee_discount_bps": 40, "max_single_trade": 100000}
-        elif score >= 750:
-            return {"tier": "Gold Merchant", "badge": "🥇", "fee_discount_bps": 20, "max_single_trade": 50000}
-        elif score >= 500:
-            return {"tier": "Verified Trader", "badge": "🥈", "fee_discount_bps": 10, "max_single_trade": 15000}
-        elif score >= 250:
-            return {"tier": "Established", "badge": "🥉", "fee_discount_bps": 0, "max_single_trade": 5000}
-        else:
-            return {"tier": "Unverified / New", "badge": "⚪", "fee_discount_bps": 0, "max_single_trade": 1000}
-
-    @staticmethod
-    def generate_reputation_embed_data(user_discord_id: str, score: int, total_vol: float, trades: int) -> Dict[str, Any]:
-        """Formats VouchScore data into Discord-ready card fields."""
-        tier_info = VouchScoreEngine.get_tier(score)
-        return {
-            "title": f"{tier_info['badge']} VouchScore Profile: <@{user_discord_id}>",
-            "score": f"**{score}** / 1000",
-            "tier": tier_info["tier"],
-            "total_volume": f"${total_vol:,.2f} USDC",
-            "completed_trades": trades,
-            "max_trade_limit": f"${tier_info['max_single_trade']:,} USDC",
-            "fee_discount": f"{tier_info['fee_discount_bps'] / 100}% discount"
-        }
+def get_reputation_tier(vouch_score: float, volume_usdc: float = 0.0) -> str:
+    """Determines user's role tier based on VouchScore and volume metrics."""
+    if vouch_score >= 90.0 and volume_usdc >= 50000.0:
+        return "Tier 3: Apex Trader"
+    elif vouch_score >= 70.0 and volume_usdc >= 10000.0:
+        return "Tier 2: Trusted Trader"
+    else:
+        return "Tier 1: Novice Trader"
