@@ -1,138 +1,61 @@
 import json
 import logging
-import asyncio
 import redis.asyncio as aioredis
-import discord
 
 logger = logging.getLogger("vouchsafe.relay")
 
-REDIS_RELAY_CHANNEL = "vouchsafe:liquidity:orders"
-
 class LiquidityRelay:
-    def __init__(self, bot: discord.Client, redis_url: str):
-        """
-        Initialize Redis Cross-Server Liquidity Relay.
-        
-        :param bot: The active discord.py Client / Bot instance.
-        :param redis_url: Redis connection string (e.g. redis://redis:6379/0).
-        """
+    """Cross-server global liquidity order syndication via Redis Pub/Sub."""
+    
+    def __init__(self, bot, redis_url: str):
         self.bot = bot
         self.redis_url = redis_url
-        self.redis_pub = None
-        self.redis_sub = None
+        self.redis = None
         self.pubsub = None
 
     async def initialize(self):
-        """Initialize Redis publisher and subscriber connections."""
-        self.redis_pub = aioredis.from_url(self.redis_url, decode_responses=True)
-        self.redis_sub = aioredis.from_url(self.redis_url, decode_responses=True)
-        self.pubsub = self.redis_sub.pubsub()
-        await self.pubsub.subscribe(REDIS_RELAY_CHANNEL)
-        logger.info(f"Subscribed to Redis Pub/Sub relay channel: {REDIS_RELAY_CHANNEL}")
+        """Establishes async connection to Upstash/Railway Redis instance."""
+        try:
+            self.redis = aioredis.from_url(
+                self.redis_url, 
+                decode_responses=True,
+                socket_timeout=10.0
+            )
+            self.pubsub = self.redis.pubsub()
+            logger.info("LiquidityRelay Redis client connected successfully.")
+        except Exception as e:
+            logger.error(f"LiquidityRelay Redis connection failed: {e}")
+            self.redis = None
+            self.pubsub = None
 
-    async def publish_order(self, order_data: dict):
-        """
-        Publish a buy or sell order event to all partner servers via Redis.
-        
-        Expected order_data dictionary layout:
-        {
-            "origin_guild_id": 123456789,
-            "origin_guild_name": "ComputeX Clearhouse",
-            "ticket_id": "ESC-9482",
-            "order_type": "BUY" | "SELL",
-            "title": "4x RTX 4090 Host Node Cluster",
-            "details": "High bandwidth, 128GB RAM, 24-hour rental available.",
-            "price_usdc": 450.00,
-            "vault_address": "0x71C7656EC7ab88b098defB751B7401B5f6d8976F",
-            "channel_jump_url": "https://discord.com/channels/..."
-        }
-        """
-        if not self.redis_pub:
-            await self.initialize()
+    async def publish_order(self, order_payload: dict):
+        """Publishes order payload to the global 'vouchsafe:orders' channel."""
+        if not self.redis:
+            logger.warning("Redis client offline. Order publish skipped.")
+            return
 
-        payload = json.dumps(order_data)
-        await self.redis_pub.publish(REDIS_RELAY_CHANNEL, payload)
-        logger.info(f"Published order {order_data.get('ticket_id')} to global relay channel.")
+        try:
+            message_str = json.dumps(order_payload)
+            await self.redis.publish("vouchsafe:orders", message_str)
+            logger.info(f"Published ticket {order_payload.get('ticket_id')} to global relay.")
+        except Exception as e:
+            logger.error(f"Failed to publish order to Redis: {e}")
 
     async def start_listener(self):
-        """
-        Asynchronous loop that listens for order messages from Redis Pub/Sub
-        and broadcasts embeds into designated syndication channels across partner servers.
-        """
+        """Subscribes to global orders channel and listens for incoming cross-server broadcasts."""
         if not self.pubsub:
-            await self.initialize()
+            logger.warning("PubSub connection unavailable. Listener not started.")
+            return
 
-        logger.info("Liquidity relay listener loop started.")
         try:
+            await self.pubsub.subscribe("vouchsafe:orders")
+            logger.info("LiquidityRelay listening on channel 'vouchsafe:orders'...")
+            
             async for message in self.pubsub.listen():
-                if message["type"] == "message":
-                    data_str = message["data"]
-                    try:
-                        order_data = json.loads(data_str)
-                        await self._handle_relayed_order(order_data)
-                    except json.JSONDecodeError:
-                        logger.error(f"Failed to parse relay JSON payload: {data_str}")
-                    except Exception as e:
-                        logger.error(f"Error handling relayed order event: {e}", exc_info=True)
-        except asyncio.CancelledError:
-            logger.info("Liquidity relay listener task cancelled.")
-        finally:
-            await self.cleanup()
-
-    async def _handle_relayed_order(self, order_data: dict):
-        """Converts received order payload into a formatted Discord embed and sends to partner channels."""
-        origin_guild_id = order_data.get("origin_guild_id")
-
-        for guild in self.bot.guilds:
-            # Skip broadcasting back to the guild where the order originated
-            if guild.id == origin_guild_id:
-                continue
-
-            # Look for channel named 'liquidity-board' or 'global-orders' in partner server
-            target_channel = (
-                discord.utils.get(guild.text_channels, name="liquidity-board") or
-                discord.utils.get(guild.text_channels, name="global-orders")
-            )
-
-            if not target_channel:
-                continue
-
-            order_type = str(order_data.get("order_type", "ORDER")).upper()
-            embed_color = discord.Color.green() if order_type == "SELL" else discord.Color.blue()
-
-            embed = discord.Embed(
-                title=f"🌐 Global Liquidity | {order_type}: {order_data.get('title', 'Compute Offer')}",
-                description=order_data.get("details", "No description provided."),
-                color=embed_color
-            )
-            embed.add_field(name="Ticket Ref", value=f"`{order_data.get('ticket_id', 'N/A')}`", inline=True)
-            embed.add_field(name="Amount / Rate", value=f"**${order_data.get('price_usdc', 0.00):,.2f} USDC**", inline=True)
-            embed.add_field(name="Origin Server", value=order_data.get("origin_guild_name", "Partner Guild"), inline=True)
-
-            if order_data.get("vault_address"):
-                embed.add_field(name="Escrow Vault", value=f"`{order_data.get('vault_address')}`", inline=False)
-
-            jump_url = order_data.get("channel_jump_url")
-            if jump_url:
-                embed.add_field(name="Origin Link", value=f"[Jump to Origin Ticket]({jump_url})", inline=False)
-
-            embed.set_footer(text="VouchSafe Liquidity Network • Powered by Redis Pub/Sub")
-
-            try:
-                await target_channel.send(embed=embed)
-                logger.info(f"Relayed order {order_data.get('ticket_id')} to guild: {guild.name} ({guild.id})")
-            except discord.Forbidden:
-                logger.warning(f"Permission denied to send message in #{target_channel.name} on guild {guild.id}")
-            except Exception as e:
-                logger.error(f"Failed broadcasting order to guild {guild.id}: {e}")
-
-    async def cleanup(self):
-        """Gracefully close Redis connection channels."""
-        if self.pubsub:
-            await self.pubsub.unsubscribe(REDIS_RELAY_CHANNEL)
-            await self.pubsub.close()
-        if self.redis_pub:
-            await self.redis_pub.close()
-        if self.redis_sub:
-            await self.redis_sub.close()
-        logger.info("Redis relay connections closed.")
+                if message and message.get("type") == "message":
+                    data = json.loads(message["data"])
+                    ticket_id = data.get("ticket_id")
+                    origin_guild = data.get("origin_guild_name", "Unknown Server")
+                    logger.info(f"Relayed order received from [{origin_guild}]: Ticket {ticket_id}")
+        except Exception as e:
+            logger.error(f"LiquidityRelay listener encountered error: {e}")
