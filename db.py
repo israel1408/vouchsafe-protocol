@@ -7,24 +7,41 @@ logger = logging.getLogger("vouchsafe.db")
 # Global connection pool instance
 pool = None
 
-async def init_db(dsn: str):
-    """Initializes the PostgreSQL connection pool using asyncpg."""
+import asyncpg
+import logging
+
+logger = logging.getLogger("vouchsafe.db")
+pool = None
+
+async def init_db(database_url: str):
     global pool
-    if not dsn:
-        logger.warning("DATABASE_URL not set. Database functions will run in bypass mode.")
-        return
-
-    # Fix legacy dialect prefix if present
-    if dsn.startswith("postgres://"):
-        dsn = dsn.replace("postgres://", "postgresql://", 1)
-
     try:
-        pool = await asyncpg.create_pool(dsn=dsn, min_size=1, max_size=10)
-        logger.info("PostgreSQL connection pool established.")
+        pool = await asyncpg.create_pool(dsn=database_url)
+        async with pool.acquire() as conn:
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS tickets (
+                    ticket_id VARCHAR(64) PRIMARY KEY,
+                    guild_id BIGINT NOT NULL,
+                    creator_id BIGINT NOT NULL,
+                    order_type VARCHAR(10) NOT NULL,
+                    amount NUMERIC(18, 4) NOT NULL,
+                    title TEXT NOT NULL,
+                    vault_address VARCHAR(128) NOT NULL,
+                    status VARCHAR(20) DEFAULT 'PENDING',
+                    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+                );
+
+                CREATE TABLE IF NOT EXISTS reputation (
+                    id SERIAL PRIMARY KEY,
+                    user_id BIGINT NOT NULL,
+                    rating INT CHECK (rating >= 1 AND rating <= 5),
+                    comment TEXT,
+                    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+                );
+            """)
+        logger.info("PostgreSQL database pool established and tables verified.")
     except Exception as e:
         logger.error(f"Failed to connect to PostgreSQL: {e}")
-        # Allow bot to keep running for health checks even if DB connection fails
-        pool = None
 
 
 async def create_ticket(ticket_id: str, guild_id: int, creator_id: int, order_type: str, amount: float, title: str, vault_address: str):
