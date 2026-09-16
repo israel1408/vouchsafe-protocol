@@ -12,7 +12,6 @@ from verifier import verify_host_node
 from reputation import calculate_vouch_score
 from relay import LiquidityRelay
 
-# Load environment variables
 load_dotenv()
 
 DISCORD_BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN")
@@ -24,19 +23,15 @@ TREASURY_WALLET_ADDRESS = os.getenv(
 VERCEL_DEPOSIT_URL = os.getenv("VERCEL_DEPOSIT_URL", "https://vouchsafe.vercel.app/deposit")
 PORT = int(os.getenv("PORT", 8080))
 
-# Configure Logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("vouchsafe.bot")
 
-# Bot Setup & Gateway Intents
 intents = discord.Intents.default()
 intents.message_content = True
 intents.guilds = True
 intents.members = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
-
-# Instantiate Liquidity Relay
 relay = LiquidityRelay(bot, REDIS_URL)
 
 
@@ -50,7 +45,7 @@ async def health_check(request):
 
 
 async def start_web_server():
-    """Starts lightweight web server bound to Render's dynamic PORT."""
+    """Starts web server bound to Render's dynamic PORT before Discord login."""
     app = web.Application()
     app.router.add_get("/", health_check)
     runner = web.AppRunner(app)
@@ -64,20 +59,12 @@ async def start_web_server():
 async def on_ready():
     logger.info(f"VouchSafe Bot online as {bot.user} (ID: {bot.user.id})")
 
-    # Start HTTP Web Server for Render
-    try:
-        bot.loop.create_task(start_web_server())
-    except Exception as e:
-        logger.error(f"Failed to launch HTTP health server: {e}")
-
-    # Initialize PostgreSQL Async Connection Pool
     try:
         await init_db(DATABASE_URL)
         logger.info("PostgreSQL database pool established.")
     except Exception as e:
         logger.error(f"Database initialization failed: {e}")
 
-    # Initialize Redis Liquidity Relay and start background listener
     try:
         await relay.initialize()
         bot.loop.create_task(relay.start_listener())
@@ -87,15 +74,11 @@ async def on_ready():
 
 
 # ==============================================================================
-# ESCROW & TICKET COMMANDS
+# ESCROW & REPUTATION COMMANDS
 # ==============================================================================
 
 @bot.command(name="escrow")
 async def create_escrow_cmd(ctx: commands.Context, order_type: str, amount: float, *, title: str):
-    """
-    Creates an escrow ticket, stores it in PostgreSQL, and syndicates to Redis Pub/Sub.
-    Usage: !escrow BUY 450.00 4x RTX 4090 Compute Cluster
-    """
     order_type_upper = order_type.upper()
     if order_type_upper not in ["BUY", "SELL"]:
         await ctx.send("❌ Order type must be `BUY` or `SELL`.")
@@ -103,7 +86,7 @@ async def create_escrow_cmd(ctx: commands.Context, order_type: str, amount: floa
 
     ticket_id = f"ESC-{ctx.message.id % 100000:05d}"
 
-    # Persist ticket into PostgreSQL
+    # Properly awaiting database row insertion into PostgreSQL
     try:
         await create_ticket(
             ticket_id=ticket_id,
@@ -114,10 +97,10 @@ async def create_escrow_cmd(ctx: commands.Context, order_type: str, amount: floa
             title=title,
             vault_address=TREASURY_WALLET_ADDRESS
         )
+        logger.info(f"Ticket {ticket_id} persisted to database.")
     except Exception as e:
         logger.error(f"Failed to save ticket {ticket_id} to DB: {e}")
 
-    # Render Discord UI Embed
     deposit_link = f"{VERCEL_DEPOSIT_URL}?ticket={ticket_id}&vault={TREASURY_WALLET_ADDRESS}&amount={amount}"
     embed = discord.Embed(
         title=f"🔒 Escrow Vault Ticket | {ticket_id}",
@@ -131,7 +114,6 @@ async def create_escrow_cmd(ctx: commands.Context, order_type: str, amount: floa
 
     ticket_msg = await ctx.send(embed=embed)
 
-    # Publish to Cross-Server Liquidity Relay
     order_payload = {
         "origin_guild_id": ctx.guild.id,
         "origin_guild_name": ctx.guild.name,
@@ -150,16 +132,12 @@ async def create_escrow_cmd(ctx: commands.Context, order_type: str, amount: floa
 
 @bot.command(name="status")
 async def get_status_cmd(ctx: commands.Context, ticket_id: str):
-    """Fetches real-time status of an escrow ticket from database."""
     ticket = await get_ticket(ticket_id)
     if not ticket:
         await ctx.send(f"❌ Ticket `{ticket_id}` not found.")
         return
 
-    embed = discord.Embed(
-        title=f"📋 Ticket Status | {ticket_id}",
-        color=discord.Color.blue()
-    )
+    embed = discord.Embed(title=f"📋 Ticket Status | {ticket_id}", color=discord.Color.blue())
     embed.add_field(name="Title", value=ticket["title"], inline=False)
     embed.add_field(name="Status", value=f"`{ticket['status']}`", inline=True)
     embed.add_field(name="Amount", value=f"${ticket['amount']:,.2f} USDC", inline=True)
@@ -167,15 +145,9 @@ async def get_status_cmd(ctx: commands.Context, ticket_id: str):
     await ctx.send(embed=embed)
 
 
-# ==============================================================================
-# VERIFICATION & REPUTATION COMMANDS
-# ==============================================================================
-
 @bot.command(name="verify")
 async def verify_cmd(ctx: commands.Context, ticket_id: str, host_endpoint: str):
-    """Triggers node automated verification check before releasing funds."""
     await ctx.send(f"🔍 Running verification checks on `{host_endpoint}` for ticket `{ticket_id}`...")
-    
     is_valid, report = await verify_host_node(host_endpoint)
     
     if is_valid:
@@ -191,20 +163,14 @@ async def verify_cmd(ctx: commands.Context, ticket_id: str, host_endpoint: str):
             description=f"Ticket `{ticket_id}` failed compliance checks.\n```\n{report}\n```",
             color=discord.Color.red()
         )
-    
     await ctx.send(embed=embed)
 
 
 @bot.command(name="vouch")
 async def vouch_cmd(ctx: commands.Context, target_user: discord.Member, rating: int, *, comment: str = "No comment"):
-    """
-    Submits a vouch for a counterparty to adjust their global VouchScore.
-    Usage: !vouch @user 5 Fast node setup, 100% uptime
-    """
     if rating < 1 or rating > 5:
         await ctx.send("❌ Rating must be between 1 and 5 stars.")
         return
-
     if target_user.id == ctx.author.id:
         await ctx.send("❌ You cannot vouch for yourself.")
         return
@@ -222,20 +188,23 @@ async def vouch_cmd(ctx: commands.Context, target_user: discord.Member, rating: 
 
 
 # ==============================================================================
-# ERROR HANDLING
+# ASYNC MAIN ENTRYPOINT
 # ==============================================================================
 
-@bot.event
-async def on_command_error(ctx: commands.Context, error):
-    if isinstance(error, commands.MissingRequiredArgument):
-        await ctx.send(f"❌ Missing argument: `{error.param.name}`. Type `!help` for command usage.")
-    elif isinstance(error, commands.BadArgument):
-        await ctx.send("❌ Invalid argument type provided.")
-    else:
-        logger.error(f"Unhandled error in command '{ctx.command}': {error}")
+async def main():
+    await start_web_server()
 
+    if not DISCORD_BOT_TOKEN:
+        logger.error("CRITICAL: DISCORD_BOT_TOKEN is missing from environment variables!")
+        await asyncio.Event().wait()
+        return
+
+    try:
+        async with bot:
+            await bot.start(DISCORD_BOT_TOKEN)
+    except discord.errors.LoginFailure:
+        logger.error("CRITICAL: Discord login failed! DISCORD_BOT_TOKEN is invalid or malformed.")
+        await asyncio.Event().wait()
 
 if __name__ == "__main__":
-    if not DISCORD_BOT_TOKEN:
-        raise ValueError("CRITICAL: DISCORD_BOT_TOKEN environment variable is missing.")
-    bot.run(DISCORD_BOT_TOKEN)
+    asyncio.run(main())
