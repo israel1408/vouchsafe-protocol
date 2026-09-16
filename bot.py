@@ -4,6 +4,7 @@ import logging
 import discord
 from discord.ext import commands
 from dotenv import load_dotenv
+from aiohttp import web
 
 # Local protocol modules
 from db import init_db, create_ticket, get_ticket, update_ticket_status, update_reputation
@@ -21,6 +22,7 @@ TREASURY_WALLET_ADDRESS = os.getenv(
     "TREASURY_WALLET_ADDRESS", "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"
 )
 VERCEL_DEPOSIT_URL = os.getenv("VERCEL_DEPOSIT_URL", "https://vouchsafe.vercel.app/deposit")
+PORT = int(os.getenv("PORT", 8080))
 
 # Configure Logging
 logging.basicConfig(level=logging.INFO)
@@ -38,9 +40,35 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 relay = LiquidityRelay(bot, REDIS_URL)
 
 
+# ==============================================================================
+# RENDER HEALTH CHECK SERVER
+# ==============================================================================
+
+async def health_check(request):
+    """HTTP endpoint required by Render Web Service health checks."""
+    return web.Response(text="VouchSafe Protocol Web Service is online.", status=200)
+
+
+async def start_web_server():
+    """Starts lightweight web server bound to Render's dynamic PORT."""
+    app = web.Application()
+    app.router.add_get("/", health_check)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", PORT)
+    await site.start()
+    logger.info(f"Render HTTP health check server active on port {PORT}")
+
+
 @bot.event
 async def on_ready():
     logger.info(f"VouchSafe Bot online as {bot.user} (ID: {bot.user.id})")
+
+    # Start HTTP Web Server for Render
+    try:
+        bot.loop.create_task(start_web_server())
+    except Exception as e:
+        logger.error(f"Failed to launch HTTP health server: {e}")
 
     # Initialize PostgreSQL Async Connection Pool
     try:
@@ -122,7 +150,7 @@ async def create_escrow_cmd(ctx: commands.Context, order_type: str, amount: floa
 
 @bot.command(name="status")
 async def get_status_cmd(ctx: commands.Context, ticket_id: str):
-    """Fetches the real-time status of an escrow ticket from the database."""
+    """Fetches real-time status of an escrow ticket from database."""
     ticket = await get_ticket(ticket_id)
     if not ticket:
         await ctx.send(f"❌ Ticket `{ticket_id}` not found.")
