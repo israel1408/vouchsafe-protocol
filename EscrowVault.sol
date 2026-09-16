@@ -5,103 +5,92 @@ import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 
 contract EscrowVault is ReentrancyGuard {
-    enum State { Created, Funded, Released, Refunded, Disputed }
+    enum VaultState { AwaitingDeposit, FundsLocked, Released, Refunded }
 
+    IERC20 public immutable usdcToken;
     address public immutable factory;
     address public immutable buyer;
     address public immutable seller;
-    address public immutable serverOwner;
-    address public immutable protocolWallet;
-    address public immutable tokenAddress; // address(0) for Native ETH
+    address public immutable platformFeeRecipient;
+    
+    uint256 public immutable amountUSDC;
+    VaultState public state;
 
-    uint256 public immutable amount;
-    uint256 public immutable createdAt;
-    uint256 public immutable timelockDuration;
-    State public currentState;
-
-    uint256 public constant PROTOCOL_FEE_BPS = 160; // 1.6%
-    uint256 public constant SERVER_FEE_BPS = 40;   // 0.4%
-    uint256 public constant BPS_DENOMINATOR = 10000;
+    uint256 public constant SELLER_BPS = 9800;      // 98.0%
+    uint256 public constant PLATFORM_BPS = 160;     // 1.6%
+    uint256 public constant TREASURY_BPS = 40;      // 0.4%
+    address public immutable treasuryRecipient;
 
     event VaultFunded(uint256 amount);
-    event VaultReleased(uint256 sellerAmount, uint256 protocolFee, uint256 serverFee);
-    event VaultRefunded();
+    event VaultReleased(uint256 sellerAmount, uint256 platformFee, uint256 treasuryFee);
+    event VaultRefunded(uint256 amount);
 
-    modifier onlyFactory() {
-        require(msg.sender == factory, "Unauthorized: Only Factory");
+    modifier onlyBuyer() {
+        require(msg.sender == buyer, "EscrowVault: Only buyer can call");
+        _;
+    }
+
+    modifier onlyFactoryOrBuyer() {
+        require(msg.sender == buyer || msg.sender == factory, "EscrowVault: Unauthorized");
         _;
     }
 
     constructor(
+        address _usdcToken,
         address _buyer,
         address _seller,
-        address _serverOwner,
-        address _protocolWallet,
-        address _tokenAddress,
-        uint256 _amount,
-        uint256 _timelockDuration
+        uint256 _amountUSDC,
+        address _platformFeeRecipient,
+        address _treasuryRecipient
     ) {
+        usdcToken = IERC20(_usdcToken);
         factory = msg.sender;
         buyer = _buyer;
         seller = _seller;
-        serverOwner = _serverOwner;
-        protocolWallet = _protocolWallet;
-        tokenAddress = _tokenAddress;
-        amount = _amount;
-        timelockDuration = _timelockDuration;
-        createdAt = block.timestamp;
-        currentState = State.Created;
+        amountUSDC = _amountUSDC;
+        platformFeeRecipient = _platformFeeRecipient;
+        treasuryRecipient = _treasuryRecipient;
+        state = VaultState.AwaitingDeposit;
     }
 
-    function deposit() external payable nonReentrant {
-        require(currentState == State.Created, "Invalid State");
-        require(msg.sender == buyer, "Only Buyer");
+    /// @notice Buyer calls this to fund the vault with USDC
+    function fundVault() external nonReentrant {
+        require(state == VaultState.AwaitingDeposit, "EscrowVault: Invalid state");
+        require(msg.sender == buyer, "EscrowVault: Only buyer can fund");
 
-        if (tokenAddress == address(0)) {
-            require(msg.value == amount, "Incorrect ETH Amount");
-        } else {
-            require(msg.value == 0, "ETH Not Accepted");
-            IERC20(tokenAddress).transferFrom(msg.sender, address(this), amount);
-        }
+        state = VaultState.FundsLocked;
+        require(
+            usdcToken.transferFrom(msg.sender, address(this), amountUSDC),
+            "EscrowVault: USDC transfer failed"
+        );
 
-        currentState = State.Funded;
-        emit VaultFunded(amount);
+        emit VaultFunded(amountUSDC);
     }
 
-    function release() external onlyFactory nonReentrant {
-        require(currentState == State.Funded, "Funds Not Locked");
+    /// @notice Releases funds according to fee splits upon completion
+    function releaseFunds() external onlyFactoryOrBuyer nonReentrant {
+        require(state == VaultState.FundsLocked, "EscrowVault: Funds not locked");
 
-        uint256 protocolFee = (amount * PROTOCOL_FEE_BPS) / BPS_DENOMINATOR;
-        uint256 serverFee = (amount * SERVER_FEE_BPS) / BPS_DENOMINATOR;
-        uint256 sellerPayout = amount - protocolFee - serverFee;
+        state = VaultState.Released;
 
-        currentState = State.Released;
+        uint256 sellerPayout = (amountUSDC * SELLER_BPS) / 10000;
+        uint256 platformFee = (amountUSDC * PLATFORM_BPS) / 10000;
+        uint256 treasuryFee = amountUSDC - sellerPayout - platformFee;
 
-        if (tokenAddress == address(0)) {
-            payable(seller).transfer(sellerPayout);
-            payable(protocolWallet).transfer(protocolFee);
-            payable(serverOwner).transfer(serverFee);
-        } else {
-            IERC20(tokenAddress).transfer(seller, sellerPayout);
-            IERC20(tokenAddress).transfer(protocolWallet, protocolFee);
-            IERC20(tokenAddress).transfer(serverOwner, serverFee);
-        }
+        require(usdcToken.transfer(seller, sellerPayout), "EscrowVault: Seller payout failed");
+        require(usdcToken.transfer(platformFeeRecipient, platformFee), "EscrowVault: Platform fee failed");
+        require(usdcToken.transfer(treasuryRecipient, treasuryFee), "EscrowVault: Treasury fee failed");
 
-        emit VaultReleased(sellerPayout, protocolFee, serverFee);
+        emit VaultReleased(sellerPayout, platformFee, treasuryFee);
     }
 
-    function refund() external nonReentrant {
-        require(currentState == State.Funded, "Funds Not Locked");
-        require(block.timestamp >= createdAt + timelockDuration, "Timelock Active");
+    /// @notice Refunds buyer in case of dispute cancellation
+    function refundBuyer() external onlyFactoryOrBuyer nonReentrant {
+        require(state == VaultState.FundsLocked, "EscrowVault: Funds not locked");
 
-        currentState = State.Refunded;
+        state = VaultState.Refunded;
+        require(usdcToken.transfer(buyer, amountUSDC), "EscrowVault: Refund failed");
 
-        if (tokenAddress == address(0)) {
-            payable(buyer).transfer(amount);
-        } else {
-            IERC20(tokenAddress).transfer(buyer, amount);
-        }
-
-        emit VaultRefunded();
+        emit VaultRefunded(amountUSDC);
     }
 }
